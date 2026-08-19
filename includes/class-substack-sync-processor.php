@@ -315,7 +315,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'imported', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content']);
+            $this->process_post_images($post_id, $post_data['post_content'], $item);
 
             if ($return_status) {
                 return [
@@ -381,7 +381,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'updated', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content']);
+            $this->process_post_images($post_id, $post_data['post_content'], $item);
 
             if ($return_status) {
                 return [
@@ -449,73 +449,149 @@ class Substack_Sync_Processor
             return $content;
         }
 
-        // 1. Use DOMDocument to safely parse nested HTML and auto-fix broken tags
         libxml_use_internal_errors(true);
         $doc = new DOMDocument();
-        
-        // Ensure UTF-8 encoding is respected so special characters don't break
         $html_wrapper = '<html><head><meta charset="utf-8"></head><body>' . $content . '</body></html>';
         @$doc->loadHTML($html_wrapper, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
-
         $xpath = new DOMXPath($doc);
 
-        // 2. Remove Substack interactive elements properly without leaving orphaned tags
-        $nodes_to_remove = $xpath->query('//div[contains(@class, "subscription") or contains(@class, "like-button")]');
-        foreach ($nodes_to_remove as $node) {
-            $node->parentNode->removeChild($node);
+        // 1. Destroy Duplicate Banner Images
+        $first_img = $xpath->query('//img')->item(0);
+        if ($first_img) {
+            $parent = $first_img->parentNode;
+            if ($parent && in_array($parent->nodeName, ['figure', 'p', 'a', 'div'])) {
+                // Remove the wrapping element so it doesn't leave an empty gap
+                $parent->parentNode->removeChild($parent);
+            } else {
+                $first_img->parentNode->removeChild($first_img);
+            }
         }
 
-        // 3. Convert all H1 tags to H2 tags
+        // 2. Format Subscription Widgets & Buttons
+        $feed_url = $this->settings['feed_url'] ?? '';
+        $subscribe_url = str_replace('/feed', '', $feed_url) . '/subscribe';
+        
+        $sub_nodes = $xpath->query('
+            //*[contains(@class, "subscription")] | 
+            //a[contains(@class, "button") and contains(@href, "subscribe")] |
+            //table[contains(@class, "button")]//a[contains(@href, "subscribe")]
+        ');
+        
+        foreach ($sub_nodes as $node) {
+            $clean_p = $doc->createElement('p');
+            $strong = $doc->createElement('strong');
+            $link = $doc->createElement('a', 'Subscribe to our newsletter on Substack');
+            
+            $link->setAttribute('href', esc_url($subscribe_url));
+            $link->setAttribute('target', '_blank');
+            
+            $strong->appendChild($link);
+            $clean_p->appendChild($strong);
+            
+            // Step up to the highest wrapper to replace the whole block cleanly
+            $target_node = $node;
+            while ($target_node->parentNode && in_array($target_node->parentNode->nodeName, ['p', 'div', 'td', 'tr', 'table'])) {
+                if (strpos($target_node->parentNode->getAttribute('class'), 'button') !== false || strpos($target_node->parentNode->getAttribute('class'), 'subscription') !== false) {
+                    $target_node = $target_node->parentNode;
+                } else {
+                    break;
+                }
+            }
+            
+            if ($target_node->parentNode) {
+                $target_node->parentNode->replaceChild($clean_p, $target_node);
+            }
+        }
+
+        // 3. Brute-Force Destroy Yellow Ovals & Social Junk
+        $nodes_to_remove = $xpath->query('
+            //svg |
+            //*[contains(@class, "like-button")] | 
+            //a[contains(@href, "action=share")] | 
+            //a[contains(@href, "utm_source=share")] | 
+            //a[contains(@href, "/comments")] |
+            //a[contains(@href, "/restack")] |
+            //table[contains(@class, "share")]
+        ');
+        foreach ($nodes_to_remove as $node) {
+            if ($node->parentNode) {
+                $node->parentNode->removeChild($node);
+            }
+        }
+
+        // 4. Brute-Force Empty Link Killer (Kills leftover yellow ovals)
+        $empty_links = $xpath->query('//a[normalize-space(.)=""]');
+        foreach ($empty_links as $link) {
+            // Only kill it if it doesn't contain a valid image
+            if ($link->getElementsByTagName('img')->length === 0 && $link->parentNode) {
+                $link->parentNode->removeChild($link);
+            }
+        }
+
+        // 5. Convert H1 to H2
         $h1s = $doc->getElementsByTagName('h1');
-        // Loop backwards when removing/replacing nodes in a NodeList
         for ($i = $h1s->length - 1; $i >= 0; $i--) {
             $h1 = $h1s->item($i);
             $h2 = $doc->createElement('h2');
-            
-            // Move all inner text and formatting
             while ($h1->firstChild) {
                 $h2->appendChild($h1->firstChild);
             }
-            
             $h1->parentNode->replaceChild($h2, $h1);
         }
 
-        // 4. Extract the cleaned HTML back out of the body wrapper
+        // Extract HTML
         $body = $doc->getElementsByTagName('body')->item(0);
         $cleaned_html = '';
-        foreach ($body->childNodes as $child) {
-            $cleaned_html .= $doc->saveHTML($child);
+        if ($body) {
+            foreach ($body->childNodes as $child) {
+                $cleaned_html .= $doc->saveHTML($child);
+            }
         }
 
-        // 5. Strip inline classes and styles to prevent theme conflicts
+        // Final Cleanup
         $cleaned_html = preg_replace('/\s(?:class|style)="[^"]*"/is', '', $cleaned_html);
-
-        // 6. Clean up any leftover empty divs
-        $cleaned_html = preg_replace('/<div>\s*<\/div>/is', '', $cleaned_html);
+        $cleaned_html = preg_replace('/<(div|p|span)[^>]*>\s*<\/\1>/is', '', $cleaned_html);
 
         return trim($cleaned_html);
     }
 
     /**
-     * Process and import images from post content.
+     * Process and import images from post content and RSS metadata.
      *
      * @param int $post_id The WordPress post ID.
      * @param string $content The post content.
+     * @param mixed $item The SimplePie feed item (optional).
      */
-    private function process_post_images(int $post_id, string $content): void
+    private function process_post_images(int $post_id, string $content, $item = null): void
     {
-        $doc = new DOMDocument();
-        @$doc->loadHTML($content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        // Check if we already have a featured image so we don't overwrite it on updates
+        $first_image_set = has_post_thumbnail($post_id);
 
+        // 1. Try to grab the hidden Substack thumbnail from the RSS enclosure
+        if (!$first_image_set && $item) {
+            if ($enclosure = $item->get_enclosure()) {
+                $src = $enclosure->get_link();
+                if (!empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
+                    $attachment_id = media_sideload_image($src, $post_id, '', 'id');
+                    if (!is_wp_error($attachment_id)) {
+                        set_post_thumbnail($post_id, $attachment_id);
+                        $first_image_set = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback: Scan the article content for inline images
+        $doc = new DOMDocument();
+        @$doc->loadHTML('<?xml encoding="utf-8" ?>' . $content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         $images = $doc->getElementsByTagName('img');
-        $first_image_set = false;
 
         foreach ($images as $img) {
             $src = $img->getAttribute('src');
-            if (! empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
+            if (!empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
                 $attachment_id = media_sideload_image($src, $post_id, '', 'id');
-
-                if (! is_wp_error($attachment_id) && ! $first_image_set) {
+                // Set the first embedded image as the featured image if we don't have one yet
+                if (!is_wp_error($attachment_id) && !$first_image_set) {
                     set_post_thumbnail($post_id, $attachment_id);
                     $first_image_set = true;
                 }
