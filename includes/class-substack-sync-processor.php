@@ -351,7 +351,16 @@ class Substack_Sync_Processor
     {
         $post_data = $this->prepare_post_data($item);
         $post_data['ID'] = $existing_post['post_id'];
-        $post_data['post_status'] = 'draft'; // Set to draft for review
+        $post_data = $this->prepare_post_data($item);
+        $post_data['ID'] = $existing_post['post_id'];
+        
+        // Obey the 'Update Post Status' setting
+        $update_status = $this->settings['update_post_status'] ?? 'publish';
+        if ($update_status === 'keep') {
+            unset($post_data['post_status']);
+        } else {
+            $post_data['post_status'] = $update_status;
+        }
         $post_title = $post_data['post_title'];
         $guid = $item->get_id();
 
@@ -414,7 +423,7 @@ class Substack_Sync_Processor
         $post_data = [
             'post_title' => $title,
             'post_content' => $content,
-            'post_status' => $this->settings['default_post_status'] ?? 'draft',
+            'post_status' => $this->settings['default_post_status'] ?? 'publish',
             'post_author' => $this->settings['default_author'] ?? 1,
             'post_date' => $item->get_date('Y-m-d H:i:s'),
             'post_type' => 'post',
@@ -436,17 +445,55 @@ class Substack_Sync_Processor
      */
     private function process_content(string $content): string
     {
-        // Replace Substack-specific elements with subscription links
-        $subscription_link = sprintf(
-            '<div class="substack-subscribe-block"><a href="%s" target="_blank">Subscribe to our newsletter</a></div>',
-            esc_url($this->settings['feed_url'] ?? '')
-        );
+        if (empty(trim($content))) {
+            return $content;
+        }
 
-        // Remove or replace Substack interactive elements
-        $content = preg_replace('/<div[^>]*class="[^"]*subscription[^"]*"[^>]*>.*?<\/div>/is', $subscription_link, $content);
-        $content = preg_replace('/<div[^>]*class="[^"]*like-button[^"]*"[^>]*>.*?<\/div>/is', '', $content);
+        // 1. Use DOMDocument to safely parse nested HTML and auto-fix broken tags
+        libxml_use_internal_errors(true);
+        $doc = new DOMDocument();
+        
+        // Ensure UTF-8 encoding is respected so special characters don't break
+        $html_wrapper = '<html><head><meta charset="utf-8"></head><body>' . $content . '</body></html>';
+        @$doc->loadHTML($html_wrapper, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
 
-        return $content;
+        $xpath = new DOMXPath($doc);
+
+        // 2. Remove Substack interactive elements properly without leaving orphaned tags
+        $nodes_to_remove = $xpath->query('//div[contains(@class, "subscription") or contains(@class, "like-button")]');
+        foreach ($nodes_to_remove as $node) {
+            $node->parentNode->removeChild($node);
+        }
+
+        // 3. Convert all H1 tags to H2 tags
+        $h1s = $doc->getElementsByTagName('h1');
+        // Loop backwards when removing/replacing nodes in a NodeList
+        for ($i = $h1s->length - 1; $i >= 0; $i--) {
+            $h1 = $h1s->item($i);
+            $h2 = $doc->createElement('h2');
+            
+            // Move all inner text and formatting
+            while ($h1->firstChild) {
+                $h2->appendChild($h1->firstChild);
+            }
+            
+            $h1->parentNode->replaceChild($h2, $h1);
+        }
+
+        // 4. Extract the cleaned HTML back out of the body wrapper
+        $body = $doc->getElementsByTagName('body')->item(0);
+        $cleaned_html = '';
+        foreach ($body->childNodes as $child) {
+            $cleaned_html .= $doc->saveHTML($child);
+        }
+
+        // 5. Strip inline classes and styles to prevent theme conflicts
+        $cleaned_html = preg_replace('/\s(?:class|style)="[^"]*"/is', '', $cleaned_html);
+
+        // 6. Clean up any leftover empty divs
+        $cleaned_html = preg_replace('/<div>\s*<\/div>/is', '', $cleaned_html);
+
+        return trim($cleaned_html);
     }
 
     /**
@@ -628,7 +675,7 @@ class Substack_Sync_Processor
         );
     }
 
-    /**
+   /**
      * Rollback all synced posts.
      *
      * @return int Number of posts deleted.
@@ -637,12 +684,25 @@ class Substack_Sync_Processor
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
-
         $post_ids = $wpdb->get_col("SELECT post_id FROM $table_name WHERE post_id > 0");
-        $deleted_count = 0;
 
+        $deleted_count = 0;
+        $rollback_action = $this->settings['rollback_action'] ?? 'trash';
+        
         foreach ($post_ids as $post_id) {
-            if (wp_delete_post($post_id, true)) {
+            $post_id_int = (int) $post_id;
+            $success = false;
+
+            if ($rollback_action === 'draft') {
+                $result = wp_update_post(['ID' => $post_id_int, 'post_status' => 'draft']);
+                $success = !is_wp_error($result) && $result > 0;
+            } else {
+                // False moves it to trash instead of permanent deletion
+                $result = wp_delete_post($post_id_int, false); 
+                $success = (bool) $result;
+            }
+
+            if ($success) {
                 $deleted_count++;
             }
         }
@@ -662,12 +722,25 @@ class Substack_Sync_Processor
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
-
         $post_ids = $wpdb->get_col("SELECT post_id FROM $table_name WHERE status = 'error' AND post_id > 0");
-        $deleted_count = 0;
 
+        $deleted_count = 0;
+        $rollback_action = $this->settings['rollback_action'] ?? 'trash';
+        
         foreach ($post_ids as $post_id) {
-            if (wp_delete_post($post_id, true)) {
+            $post_id_int = (int) $post_id;
+            $success = false;
+
+            if ($rollback_action === 'draft') {
+                $result = wp_update_post(['ID' => $post_id_int, 'post_status' => 'draft']);
+                $success = !is_wp_error($result) && $result > 0;
+            } else {
+                // False moves it to trash instead of permanent deletion
+                $result = wp_delete_post($post_id_int, false); 
+                $success = (bool) $result;
+            }
+
+            if ($success) {
                 $deleted_count++;
             }
         }
@@ -689,7 +762,6 @@ class Substack_Sync_Processor
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
-
         $post_ids = $wpdb->get_col(
             $wpdb->prepare("
                 SELECT post_id 
@@ -700,9 +772,22 @@ class Substack_Sync_Processor
         );
 
         $deleted_count = 0;
-
+        $rollback_action = $this->settings['rollback_action'] ?? 'trash';
+        
         foreach ($post_ids as $post_id) {
-            if (wp_delete_post($post_id, true)) {
+            $post_id_int = (int) $post_id;
+            $success = false;
+
+            if ($rollback_action === 'draft') {
+                $result = wp_update_post(['ID' => $post_id_int, 'post_status' => 'draft']);
+                $success = !is_wp_error($result) && $result > 0;
+            } else {
+                // False moves it to trash instead of permanent deletion
+                $result = wp_delete_post($post_id_int, false); 
+                $success = (bool) $result;
+            }
+
+            if ($success) {
                 $deleted_count++;
             }
         }

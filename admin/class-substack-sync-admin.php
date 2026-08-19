@@ -93,6 +93,22 @@ class Substack_Sync_Admin
         );
 
         add_settings_field(
+            'update_post_status',
+            'Update Post Status',
+            [$this, 'update_post_status_callback'],
+            'substack-sync',
+            'substack_sync_main'
+        );
+        
+        add_settings_field(
+            'rollback_action',
+            'Rollback Action',
+            [$this, 'rollback_action_callback'],
+            'substack-sync',
+            'substack_sync_main'
+        );
+
+        add_settings_field(
             'delete_data_on_uninstall',
             'Delete Data on Uninstall',
             [$this, 'delete_data_callback'],
@@ -157,13 +173,41 @@ class Substack_Sync_Admin
     public function default_post_status_callback(): void
     {
         $options = get_option('substack_sync_settings', []);
-        $selected = $options['default_post_status'] ?? 'draft';
-
+        $selected = $options['default_post_status'] ?? 'publish'; // Changed default to 'publish'
         echo '<select name="substack_sync_settings[default_post_status]">';
-        echo '<option value="draft"' . selected($selected, 'draft', false) . '>Draft</option>';
         echo '<option value="publish"' . selected($selected, 'publish', false) . '>Published</option>';
+        echo '<option value="draft"' . selected($selected, 'draft', false) . '>Draft</option>';
         echo '</select>';
-        echo '<p class="description">Choose whether new posts should be imported as drafts or published immediately.</p>';
+        echo '<p class="description">Status when importing NEW posts.</p>';
+    }
+
+    /**
+     * Update post status field callback.
+     */
+    public function update_post_status_callback(): void
+    {
+        $options = get_option('substack_sync_settings', []);
+        $selected = $options['update_post_status'] ?? 'publish'; // Defaults to published
+        echo '<select name="substack_sync_settings[update_post_status]">';
+        echo '<option value="publish"' . selected($selected, 'publish', false) . '>Published</option>';
+        echo '<option value="draft"' . selected($selected, 'draft', false) . '>Draft</option>';
+        echo '<option value="keep"' . selected($selected, 'keep', false) . '>Keep Current Status</option>';
+        echo '</select>';
+        echo '<p class="description">Status when UPDATING existing posts.</p>';
+    }
+
+    /**
+     * Rollback action field callback.
+     */
+    public function rollback_action_callback(): void
+    {
+        $options = get_option('substack_sync_settings', []);
+        $selected = $options['rollback_action'] ?? 'trash';
+        echo '<select name="substack_sync_settings[rollback_action]">';
+        echo '<option value="trash"' . selected($selected, 'trash', false) . '>Move to Trash</option>';
+        echo '<option value="draft"' . selected($selected, 'draft', false) . '>Move to Draft</option>';
+        echo '</select>';
+        echo '<p class="description">What should happen to WordPress posts when you use the Rollback buttons.</p>';
     }
 
     /**
@@ -416,12 +460,6 @@ class Substack_Sync_Admin
                 });
             });
 
-            // Initialize enhanced sync functionality
-            if (document.getElementById('sync-now-btn')) {
-                new SubstackSyncProgress();
-                new SubstackAdminManager();
-            }
-
             class SubstackAdminManager {
                 constructor() {
                     this.ajaxUrl = '<?php echo admin_url('admin-ajax.php'); ?>';
@@ -566,6 +604,13 @@ class Substack_Sync_Admin
                     return colors[status] || '#666';
                 }
             }
+
+            // Properly initialize the manager AFTER the page and class have loaded
+            document.addEventListener('DOMContentLoaded', function() {
+                if (document.getElementById('rollback-all-btn')) {
+                    new SubstackAdminManager();
+                }
+            });
             </script>
             
             <style>
