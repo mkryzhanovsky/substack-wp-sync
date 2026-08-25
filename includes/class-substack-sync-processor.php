@@ -315,7 +315,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'imported', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content']);
+            $this->process_post_images($post_id, $post_data['post_content'], $item);
 
             if ($return_status) {
                 return [
@@ -351,7 +351,16 @@ class Substack_Sync_Processor
     {
         $post_data = $this->prepare_post_data($item);
         $post_data['ID'] = $existing_post['post_id'];
-        $post_data['post_status'] = 'draft'; // Set to draft for review
+        $post_data = $this->prepare_post_data($item);
+        $post_data['ID'] = $existing_post['post_id'];
+        
+        // Obey the 'Update Post Status' setting
+        $update_status = $this->settings['update_post_status'] ?? 'publish';
+        if ($update_status === 'keep') {
+            unset($post_data['post_status']);
+        } else {
+            $post_data['post_status'] = $update_status;
+        }
         $post_title = $post_data['post_title'];
         $guid = $item->get_id();
 
@@ -372,7 +381,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'updated', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content']);
+            $this->process_post_images($post_id, $post_data['post_content'], $item);
 
             if ($return_status) {
                 return [
@@ -414,7 +423,7 @@ class Substack_Sync_Processor
         $post_data = [
             'post_title' => $title,
             'post_content' => $content,
-            'post_status' => $this->settings['default_post_status'] ?? 'draft',
+            'post_status' => $this->settings['default_post_status'] ?? 'publish',
             'post_author' => $this->settings['default_author'] ?? 1,
             'post_date' => $item->get_date('Y-m-d H:i:s'),
             'post_type' => 'post',
@@ -436,39 +445,153 @@ class Substack_Sync_Processor
      */
     private function process_content(string $content): string
     {
-        // Replace Substack-specific elements with subscription links
-        $subscription_link = sprintf(
-            '<div class="substack-subscribe-block"><a href="%s" target="_blank">Subscribe to our newsletter</a></div>',
-            esc_url($this->settings['feed_url'] ?? '')
-        );
+        if (empty(trim($content))) {
+            return $content;
+        }
 
-        // Remove or replace Substack interactive elements
-        $content = preg_replace('/<div[^>]*class="[^"]*subscription[^"]*"[^>]*>.*?<\/div>/is', $subscription_link, $content);
-        $content = preg_replace('/<div[^>]*class="[^"]*like-button[^"]*"[^>]*>.*?<\/div>/is', '', $content);
+        libxml_use_internal_errors(true);
+        $doc = new DOMDocument();
+        $html_wrapper = '<html><head><meta charset="utf-8"></head><body>' . $content . '</body></html>';
+        @$doc->loadHTML($html_wrapper, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        $xpath = new DOMXPath($doc);
 
-        return $content;
+        // 1. Destroy Duplicate Banner Images
+        $first_img = $xpath->query('//img')->item(0);
+        if ($first_img) {
+            $parent = $first_img->parentNode;
+            if ($parent && in_array($parent->nodeName, ['figure', 'p', 'a', 'div'])) {
+                // Remove the wrapping element so it doesn't leave an empty gap
+                $parent->parentNode->removeChild($parent);
+            } else {
+                $first_img->parentNode->removeChild($first_img);
+            }
+        }
+
+        // 2. Format Subscription Widgets & Buttons
+        $feed_url = $this->settings['feed_url'] ?? '';
+        $subscribe_url = str_replace('/feed', '', $feed_url) . '/subscribe';
+        
+        $sub_nodes = $xpath->query('
+            //*[contains(@class, "subscription")] | 
+            //a[contains(@class, "button") and contains(@href, "subscribe")] |
+            //table[contains(@class, "button")]//a[contains(@href, "subscribe")]
+        ');
+        
+        foreach ($sub_nodes as $node) {
+            $clean_p = $doc->createElement('p');
+            $strong = $doc->createElement('strong');
+            $link = $doc->createElement('a', 'Subscribe to our newsletter on Substack');
+            
+            $link->setAttribute('href', esc_url($subscribe_url));
+            $link->setAttribute('target', '_blank');
+            
+            $strong->appendChild($link);
+            $clean_p->appendChild($strong);
+            
+            // Step up to the highest wrapper to replace the whole block cleanly
+            $target_node = $node;
+            while ($target_node->parentNode && in_array($target_node->parentNode->nodeName, ['p', 'div', 'td', 'tr', 'table'])) {
+                if (strpos($target_node->parentNode->getAttribute('class'), 'button') !== false || strpos($target_node->parentNode->getAttribute('class'), 'subscription') !== false) {
+                    $target_node = $target_node->parentNode;
+                } else {
+                    break;
+                }
+            }
+            
+            if ($target_node->parentNode) {
+                $target_node->parentNode->replaceChild($clean_p, $target_node);
+            }
+        }
+
+        // 3. Brute-Force Destroy Yellow Ovals & Social Junk
+        $nodes_to_remove = $xpath->query('
+            //svg |
+            //*[contains(@class, "like-button")] | 
+            //a[contains(@href, "action=share")] | 
+            //a[contains(@href, "utm_source=share")] | 
+            //a[contains(@href, "/comments")] |
+            //a[contains(@href, "/restack")] |
+            //table[contains(@class, "share")]
+        ');
+        foreach ($nodes_to_remove as $node) {
+            if ($node->parentNode) {
+                $node->parentNode->removeChild($node);
+            }
+        }
+
+        // 4. Brute-Force Empty Link Killer (Kills leftover yellow ovals)
+        $empty_links = $xpath->query('//a[normalize-space(.)=""]');
+        foreach ($empty_links as $link) {
+            // Only kill it if it doesn't contain a valid image
+            if ($link->getElementsByTagName('img')->length === 0 && $link->parentNode) {
+                $link->parentNode->removeChild($link);
+            }
+        }
+
+        // 5. Convert H1 to H2
+        $h1s = $doc->getElementsByTagName('h1');
+        for ($i = $h1s->length - 1; $i >= 0; $i--) {
+            $h1 = $h1s->item($i);
+            $h2 = $doc->createElement('h2');
+            while ($h1->firstChild) {
+                $h2->appendChild($h1->firstChild);
+            }
+            $h1->parentNode->replaceChild($h2, $h1);
+        }
+
+        // Extract HTML
+        $body = $doc->getElementsByTagName('body')->item(0);
+        $cleaned_html = '';
+        if ($body) {
+            foreach ($body->childNodes as $child) {
+                $cleaned_html .= $doc->saveHTML($child);
+            }
+        }
+
+        // Final Cleanup
+        $cleaned_html = preg_replace('/\s(?:class|style)="[^"]*"/is', '', $cleaned_html);
+        $cleaned_html = preg_replace('/<(div|p|span)[^>]*>\s*<\/\1>/is', '', $cleaned_html);
+
+        return trim($cleaned_html);
     }
 
     /**
-     * Process and import images from post content.
+     * Process and import images from post content and RSS metadata.
      *
      * @param int $post_id The WordPress post ID.
      * @param string $content The post content.
+     * @param mixed $item The SimplePie feed item (optional).
      */
-    private function process_post_images(int $post_id, string $content): void
+    private function process_post_images(int $post_id, string $content, $item = null): void
     {
-        $doc = new DOMDocument();
-        @$doc->loadHTML($content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        // Check if we already have a featured image so we don't overwrite it on updates
+        $first_image_set = has_post_thumbnail($post_id);
 
+        // 1. Try to grab the hidden Substack thumbnail from the RSS enclosure
+        if (!$first_image_set && $item) {
+            if ($enclosure = $item->get_enclosure()) {
+                $src = $enclosure->get_link();
+                if (!empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
+                    $attachment_id = media_sideload_image($src, $post_id, '', 'id');
+                    if (!is_wp_error($attachment_id)) {
+                        set_post_thumbnail($post_id, $attachment_id);
+                        $first_image_set = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback: Scan the article content for inline images
+        $doc = new DOMDocument();
+        @$doc->loadHTML('<?xml encoding="utf-8" ?>' . $content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         $images = $doc->getElementsByTagName('img');
-        $first_image_set = false;
 
         foreach ($images as $img) {
             $src = $img->getAttribute('src');
-            if (! empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
+            if (!empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
                 $attachment_id = media_sideload_image($src, $post_id, '', 'id');
-
-                if (! is_wp_error($attachment_id) && ! $first_image_set) {
+                // Set the first embedded image as the featured image if we don't have one yet
+                if (!is_wp_error($attachment_id) && !$first_image_set) {
                     set_post_thumbnail($post_id, $attachment_id);
                     $first_image_set = true;
                 }
@@ -628,7 +751,7 @@ class Substack_Sync_Processor
         );
     }
 
-    /**
+   /**
      * Rollback all synced posts.
      *
      * @return int Number of posts deleted.
@@ -637,12 +760,25 @@ class Substack_Sync_Processor
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
-
         $post_ids = $wpdb->get_col("SELECT post_id FROM $table_name WHERE post_id > 0");
-        $deleted_count = 0;
 
+        $deleted_count = 0;
+        $rollback_action = $this->settings['rollback_action'] ?? 'trash';
+        
         foreach ($post_ids as $post_id) {
-            if (wp_delete_post($post_id, true)) {
+            $post_id_int = (int) $post_id;
+            $success = false;
+
+            if ($rollback_action === 'draft') {
+                $result = wp_update_post(['ID' => $post_id_int, 'post_status' => 'draft']);
+                $success = !is_wp_error($result) && $result > 0;
+            } else {
+                // False moves it to trash instead of permanent deletion
+                $result = wp_delete_post($post_id_int, false); 
+                $success = (bool) $result;
+            }
+
+            if ($success) {
                 $deleted_count++;
             }
         }
@@ -662,12 +798,25 @@ class Substack_Sync_Processor
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
-
         $post_ids = $wpdb->get_col("SELECT post_id FROM $table_name WHERE status = 'error' AND post_id > 0");
-        $deleted_count = 0;
 
+        $deleted_count = 0;
+        $rollback_action = $this->settings['rollback_action'] ?? 'trash';
+        
         foreach ($post_ids as $post_id) {
-            if (wp_delete_post($post_id, true)) {
+            $post_id_int = (int) $post_id;
+            $success = false;
+
+            if ($rollback_action === 'draft') {
+                $result = wp_update_post(['ID' => $post_id_int, 'post_status' => 'draft']);
+                $success = !is_wp_error($result) && $result > 0;
+            } else {
+                // False moves it to trash instead of permanent deletion
+                $result = wp_delete_post($post_id_int, false); 
+                $success = (bool) $result;
+            }
+
+            if ($success) {
                 $deleted_count++;
             }
         }
@@ -689,7 +838,6 @@ class Substack_Sync_Processor
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
-
         $post_ids = $wpdb->get_col(
             $wpdb->prepare("
                 SELECT post_id 
@@ -700,9 +848,22 @@ class Substack_Sync_Processor
         );
 
         $deleted_count = 0;
-
+        $rollback_action = $this->settings['rollback_action'] ?? 'trash';
+        
         foreach ($post_ids as $post_id) {
-            if (wp_delete_post($post_id, true)) {
+            $post_id_int = (int) $post_id;
+            $success = false;
+
+            if ($rollback_action === 'draft') {
+                $result = wp_update_post(['ID' => $post_id_int, 'post_status' => 'draft']);
+                $success = !is_wp_error($result) && $result > 0;
+            } else {
+                // False moves it to trash instead of permanent deletion
+                $result = wp_delete_post($post_id_int, false); 
+                $success = (bool) $result;
+            }
+
+            if ($success) {
                 $deleted_count++;
             }
         }
