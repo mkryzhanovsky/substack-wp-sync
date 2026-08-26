@@ -28,4 +28,7 @@ if (isset($options['delete_data_on_uninstall']) && $options['delete_data_on_unin
     global $wpdb;
     $table_name = $wpdb->prefix . 'substack_sync_log';
     $wpdb->query("DROP TABLE IF EXISTS $table_name");
+
+    // Forget which images have already been imported
+    delete_post_meta_by_key('_substack_sync_sideloaded');
 }

@@ -19,6 +19,11 @@ declare(strict_types=1);
 class Substack_Sync_Processor
 {
     /**
+     * Meta key holding the source URLs already sideloaded for a post.
+     */
+    private const SIDELOADED_META_KEY = '_substack_sync_sideloaded';
+
+    /**
      * Plugin settings.
      *
      * @var array<string, mixed>
@@ -116,7 +121,7 @@ class Substack_Sync_Processor
                             break;
                     }
                 }
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 error_log('Substack Sync: Error processing post - ' . $e->getMessage());
                 $errors[] = $e->getMessage();
                 $posts_processed++;
@@ -237,7 +242,7 @@ class Substack_Sync_Processor
                 $result = $this->process_feed_item($item, true);
                 $posts_processed++;
                 $processed_posts[] = $result;
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 error_log('Substack Sync: Error processing post - ' . $e->getMessage());
                 $errors[] = $e->getMessage();
                 $posts_processed++;
@@ -294,7 +299,8 @@ class Substack_Sync_Processor
      */
     private function import_post($item, bool $return_status = false)
     {
-        $post_data = $this->prepare_post_data($item);
+        $banner_src = null;
+        $post_data = $this->prepare_post_data($item, $banner_src);
         $post_title = $post_data['post_title'];
         $guid = $item->get_id();
 
@@ -315,7 +321,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'imported', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content'], $item);
+            $this->process_post_images($post_id, $post_data['post_content'], $item, $banner_src);
 
             if ($return_status) {
                 return [
@@ -349,9 +355,8 @@ class Substack_Sync_Processor
      */
     private function update_post($item, array $existing_post, bool $return_status = false)
     {
-        $post_data = $this->prepare_post_data($item);
-        $post_data['ID'] = $existing_post['post_id'];
-        $post_data = $this->prepare_post_data($item);
+        $banner_src = null;
+        $post_data = $this->prepare_post_data($item, $banner_src);
         $post_data['ID'] = $existing_post['post_id'];
         
         // Obey the 'Update Post Status' setting
@@ -381,7 +386,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'updated', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content'], $item);
+            $this->process_post_images($post_id, $post_data['post_content'], $item, $banner_src);
 
             if ($return_status) {
                 return [
@@ -409,11 +414,12 @@ class Substack_Sync_Processor
      * Prepare post data for WordPress insertion.
      *
      * @param SimplePie_Item $item The feed item.
+     * @param string|null $banner_src Receives the URL of the banner image lifted out of the body.
      * @return array<string, mixed> Post data array.
      */
-    private function prepare_post_data($item): array
+    private function prepare_post_data($item, ?string &$banner_src = null): array
     {
-        $content = $this->process_content($item->get_content());
+        $content = $this->process_content($item->get_content(), $banner_src);
         $title = $item->get_title();
 
         // Apply category mapping based on content and title
@@ -441,10 +447,14 @@ class Substack_Sync_Processor
      * Process and clean content from Substack.
      *
      * @param string $content The raw content from Substack.
+     * @param string|null $banner_src Receives the URL of the banner image lifted out of the body,
+     *                                or null if no banner was removed.
      * @return string The processed content.
      */
-    private function process_content(string $content): string
+    private function process_content(string $content, ?string &$banner_src = null): string
     {
+        $banner_src = null;
+
         if (empty(trim($content))) {
             return $content;
         }
@@ -455,15 +465,33 @@ class Substack_Sync_Processor
         @$doc->loadHTML($html_wrapper, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         $xpath = new DOMXPath($doc);
 
-        // 1. Destroy Duplicate Banner Images
+        // 1. Lift the banner image out of the body. It comes back as the featured image;
+        //    process_post_images() puts it back inline if it cannot be imported.
         $first_img = $xpath->query('//img')->item(0);
-        if ($first_img) {
-            $parent = $first_img->parentNode;
-            if ($parent && in_array($parent->nodeName, ['figure', 'p', 'a', 'div'])) {
-                // Remove the wrapping element so it doesn't leave an empty gap
-                $parent->parentNode->removeChild($parent);
-            } else {
-                $first_img->parentNode->removeChild($first_img);
+        if ($first_img instanceof DOMElement) {
+            $candidate = $this->normalize_image_url($first_img->getAttribute('src'));
+
+            // Substack wraps the thumbnail in a link to the full-size original; prefer that.
+            $link = $xpath->query('ancestor::a[@href][1]', $first_img)->item(0);
+            if ($link instanceof DOMElement) {
+                $href = $this->normalize_image_url($link->getAttribute('href'));
+                if ($this->is_image_url($href)) {
+                    $candidate = $href;
+                }
+            }
+
+            // Only remove it if we captured a URL we can restore it from.
+            if ($this->is_image_url($candidate)) {
+                $banner_src = $candidate;
+                $this->remove_banner_node($first_img);
+            }
+        }
+
+        // Drop captions orphaned by the removal above
+        $orphan_captions = $xpath->query('//figure[figcaption and not(.//img) and not(.//iframe) and not(.//video)]');
+        foreach ($orphan_captions as $orphan) {
+            if ($orphan->parentNode) {
+                $orphan->parentNode->removeChild($orphan);
             }
         }
 
@@ -550,9 +578,92 @@ class Substack_Sync_Processor
 
         // Final Cleanup
         $cleaned_html = preg_replace('/\s(?:class|style)="[^"]*"/is', '', $cleaned_html);
-        $cleaned_html = preg_replace('/<(div|p|span)[^>]*>\s*<\/\1>/is', '', $cleaned_html);
+
+        // Collapse wrappers left empty by the removals above. Substack nests these
+        // (div > figure > a > div > picture), so run the pass until it stops matching.
+        for ($i = 0; $i < 5; $i++) {
+            $collapsed = preg_replace('/<(div|p|span|figure|picture|a)[^>]*>\s*<\/\1>/is', '', $cleaned_html);
+            if ($collapsed === null || $collapsed === $cleaned_html) {
+                break;
+            }
+            $cleaned_html = $collapsed;
+        }
 
         return trim($cleaned_html);
+    }
+
+    /**
+     * Remove a banner image together with the wrappers that exist only to hold it.
+     *
+     * Walks up from the image while the parent contains no text and no other image,
+     * so <div><figure><a><picture><img></picture></a></figure></div> disappears whole
+     * but a <figure> with a caption keeps its caption.
+     *
+     * @param DOMElement $img The image to remove.
+     */
+    private function remove_banner_node(DOMElement $img): void
+    {
+        $wrappers = ['picture', 'a', 'figure', 'div', 'p', 'span'];
+        $node = $img;
+
+        while (($parent = $node->parentNode) instanceof DOMElement
+            && in_array(strtolower($parent->nodeName), $wrappers, true)
+            && trim($parent->textContent) === ''
+            && $parent->getElementsByTagName('img')->length <= 1) {
+            $node = $parent;
+        }
+
+        if ($node->parentNode) {
+            $node->parentNode->removeChild($node);
+        }
+    }
+
+    /**
+     * Unwrap a Substack CDN URL to the original image it proxies.
+     *
+     * Substack serves images as https://substackcdn.com/image/fetch/<transforms>/<encoded original>,
+     * and the transforms often downscale (w_256). The encoded original is full size and gives
+     * the attachment a sane filename.
+     *
+     * @param string $url The URL to normalize.
+     * @return string The original image URL, or the input unchanged.
+     */
+    private function normalize_image_url(string $url): string
+    {
+        $url = trim($url);
+
+        if ($url === '') {
+            return '';
+        }
+
+        if (preg_match('~/(https?%3A%2F%2F.+)$~i', $url, $matches)) {
+            $decoded = urldecode($matches[1]);
+            if (filter_var($decoded, FILTER_VALIDATE_URL)) {
+                return $decoded;
+            }
+        }
+
+        return $url;
+    }
+
+    /**
+     * Check whether a URL points at an image WordPress will sideload.
+     *
+     * media_sideload_image() requires the extension in the URL, so anything else
+     * (podcast enclosures, for instance) is not worth downloading.
+     *
+     * @param string $url The URL to check.
+     * @return bool True if the URL looks like an image.
+     */
+    private function is_image_url(string $url): bool
+    {
+        if ($url === '' || ! filter_var($url, FILTER_VALIDATE_URL)) {
+            return false;
+        }
+
+        $path = (string) parse_url($url, PHP_URL_PATH);
+
+        return (bool) preg_match('/\.(jpe?g|jpe|png|gif|webp|avif)$/i', $path);
     }
 
     /**
@@ -561,8 +672,9 @@ class Substack_Sync_Processor
      * @param int $post_id The WordPress post ID.
      * @param string $content The post content.
      * @param mixed $item The SimplePie feed item (optional).
+     * @param string|null $banner_src The banner image process_content() lifted out of the body.
      */
-    private function process_post_images(int $post_id, string $content, $item = null): void
+    private function process_post_images(int $post_id, string $content, $item = null, ?string $banner_src = null): void
     {
         // Check if we already have a featured image so we don't overwrite it on updates
         $first_image_set = has_post_thumbnail($post_id);
@@ -570,10 +682,11 @@ class Substack_Sync_Processor
         // 1. Try to grab the hidden Substack thumbnail from the RSS enclosure
         if (!$first_image_set && $item) {
             if ($enclosure = $item->get_enclosure()) {
-                $src = $enclosure->get_link();
-                if (!empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
-                    $attachment_id = media_sideload_image($src, $post_id, '', 'id');
-                    if (!is_wp_error($attachment_id)) {
+                $src = $this->normalize_image_url((string) $enclosure->get_link());
+                // Enclosures are not always images - podcast episodes ship an .mp3 here.
+                if ($this->is_image_url($src)) {
+                    $attachment_id = $this->sideload_image($post_id, $src);
+                    if ($attachment_id) {
                         set_post_thumbnail($post_id, $attachment_id);
                         $first_image_set = true;
                     }
@@ -581,22 +694,123 @@ class Substack_Sync_Processor
             }
         }
 
-        // 2. Fallback: Scan the article content for inline images
-        $doc = new DOMDocument();
-        @$doc->loadHTML('<?xml encoding="utf-8" ?>' . $content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
-        $images = $doc->getElementsByTagName('img');
+        // 2. Fall back to the banner image that was lifted out of the body
+        if (!$first_image_set && $banner_src) {
+            $attachment_id = $this->sideload_image($post_id, $banner_src);
+            if ($attachment_id) {
+                set_post_thumbnail($post_id, $attachment_id);
+                $first_image_set = true;
+            }
+        }
 
-        foreach ($images as $img) {
-            $src = $img->getAttribute('src');
-            if (!empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
-                $attachment_id = media_sideload_image($src, $post_id, '', 'id');
+        // 3. Fallback: Scan the article content for inline images
+        if (trim($content) !== '') {
+            $doc = new DOMDocument();
+            @$doc->loadHTML('<?xml encoding="utf-8" ?>' . $content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+            $images = $doc->getElementsByTagName('img');
+
+            foreach ($images as $img) {
+                $src = $this->normalize_image_url($img->getAttribute('src'));
+                $attachment_id = $this->sideload_image($post_id, $src);
                 // Set the first embedded image as the featured image if we don't have one yet
-                if (!is_wp_error($attachment_id) && !$first_image_set) {
+                if ($attachment_id && !$first_image_set) {
                     set_post_thumbnail($post_id, $attachment_id);
                     $first_image_set = true;
                 }
             }
         }
+
+        // 4. Nothing could be imported: put the banner back in the body rather than lose it.
+        if (!$first_image_set && $banner_src) {
+            $this->restore_banner_image($post_id, $banner_src);
+        }
+    }
+
+    /**
+     * Download a remote image into the media library, once per post.
+     *
+     * media_sideload_image() has no de-duplication of its own, so on an hourly sync every
+     * image in every post would be downloaded again on every run.
+     *
+     * @param int $post_id The post to attach the image to.
+     * @param string $url The image URL.
+     * @return int|null The attachment ID, or null if it could not be imported.
+     */
+    private function sideload_image(int $post_id, string $url): ?int
+    {
+        if (!$this->is_image_url($url)) {
+            return null;
+        }
+
+        $imported = get_post_meta($post_id, self::SIDELOADED_META_KEY, true);
+        if (!is_array($imported)) {
+            $imported = [];
+        }
+
+        $key = md5($url);
+        if (isset($imported[$key]) && get_post_status((int) $imported[$key]) !== false) {
+            return (int) $imported[$key];
+        }
+
+        $this->load_media_dependencies();
+
+        $attachment_id = media_sideload_image($url, $post_id, '', 'id');
+
+        if (is_wp_error($attachment_id)) {
+            error_log('Substack Sync: Failed to import image ' . $url . ' - ' . $attachment_id->get_error_message());
+
+            return null;
+        }
+
+        $imported[$key] = (int) $attachment_id;
+        update_post_meta($post_id, self::SIDELOADED_META_KEY, $imported);
+
+        return (int) $attachment_id;
+    }
+
+    /**
+     * Load the media functions the sideload depends on.
+     *
+     * media_sideload_image(), media_handle_sideload() and download_url() live in wp-admin and
+     * are loaded automatically for admin requests only. Without this the hourly cron run hits
+     * an undefined function and dies before the featured image is ever set.
+     */
+    private function load_media_dependencies(): void
+    {
+        if (function_exists('media_sideload_image')
+            && function_exists('download_url')
+            && function_exists('wp_read_image_metadata')) {
+            return;
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+    }
+
+    /**
+     * Put the banner image back at the top of the post body.
+     *
+     * Used when no image could be imported at all - a hotlinked banner beats no banner.
+     * The next successful sync sets the featured image and the body goes back to clean.
+     *
+     * @param int $post_id The post to restore the banner on.
+     * @param string $banner_src The banner image URL.
+     */
+    private function restore_banner_image(int $post_id, string $banner_src): void
+    {
+        $post = get_post($post_id);
+
+        if (!$post || strpos($post->post_content, esc_url($banner_src)) !== false) {
+            return;
+        }
+
+        wp_update_post([
+            'ID' => $post_id,
+            'post_content' => '<figure><img src="' . esc_url($banner_src) . '" alt="" /></figure>' . "\n" . $post->post_content,
+        ]);
+
+        error_log('Substack Sync: Could not import the banner image for post ' . $post_id . '; kept it inline instead.');
     }
 
     /**
